@@ -1544,19 +1544,86 @@ function getShiShen(dayGan, targetGan) {
   return map[diff] || '';
 }
 
-function getXiYongShen(wxCount) {
-  var wxs = ['金','木','水','火','土'];
-  var minWx = wxs[0], maxWx = wxs[0];
-  var minCount = wxCount[minWx] || 0, maxCount = wxCount[maxWx] || 0;
-  for (var i = 1; i < wxs.length; i++) {
-    var cnt = wxCount[wxs[i]] || 0;
-    if (cnt < minCount) { minCount = cnt; minWx = wxs[i]; }
-    if (cnt > maxCount) { maxCount = cnt; maxWx = wxs[i]; }
+/* 克我者（官杀） */
+var WX_KEWO = {'木':'金','火':'水','土':'木','金':'火','水':'土'};
+function wxKeWo(wx) { return WX_KEWO[wx] || ''; }
+
+/**
+ * 计算日主强弱（含月令权重）
+ * 返回 { name, score }
+ * 月令同我/生我 → 得令；月令克我/我生/我克 → 失令
+ */
+function calcDayStrength(dayPillar, monthPillar, wxCount) {
+  var dayWx = TG_WX[dayPillar.gan];
+  var monthWx = DZ_WX[monthPillar.zhi];
+  var yin = wxShengWo(dayWx);   // 印
+  var bi  = dayWx;               // 比劫
+  var shi = wxSheng(dayWx);      // 食伤
+  var cai = wxKe(dayWx);         // 财
+  var sha = wxKeWo(dayWx);       // 官杀
+
+  var score = 0;
+  // 月令权重最大（±3）
+  if (monthWx === bi)  score += 3;
+  else if (monthWx === yin) score += 2;
+  else if (monthWx === shi) score -= 2;
+  else if (monthWx === cai) score -= 2;
+  else if (monthWx === sha) score -= 3;
+
+  // 五行总量：印比 vs 食财杀
+  var support = (wxCount[bi]||0) + (wxCount[yin]||0);
+  var weaken  = (wxCount[shi]||0) + (wxCount[cai]||0) + (wxCount[sha]||0);
+  score += (support - weaken);
+
+  var name;
+  if (score >= 4) name = '身强';
+  else if (score >= 1) name = '中和偏强';
+  else if (score >= -2) name = '中和偏弱';
+  else name = '身弱';
+  return { name: name, score: score };
+}
+
+/**
+ * 基于强弱推喜用神
+ * 身弱：喜印比，忌食财杀
+ * 身强：喜食财杀，忌印比
+ */
+function getXiYongShen(wxCount, dayPillar, monthPillar) {
+  // 兼容旧调用（无 dayPillar 时退化为均衡逻辑）
+  if (!dayPillar) {
+    var wxs = ['金','木','水','火','土'];
+    var minWx = wxs[0], maxWx = wxs[0];
+    var minCount = wxCount[minWx] || 0, maxCount = wxCount[maxWx] || 0;
+    for (var i = 1; i < wxs.length; i++) {
+      var cnt = wxCount[wxs[i]] || 0;
+      if (cnt < minCount) { minCount = cnt; minWx = wxs[i]; }
+      if (cnt > maxCount) { maxCount = cnt; maxWx = wxs[i]; }
+    }
+    return { xiShen: wxShengWo(minWx), yongShen: wxKe(maxWx) || wxSheng(wxShengWo(minWx)),
+             weak: minWx, strong: maxWx, strengthName: '中和', wxGood: [], wxAvoid: [] };
   }
-  var xiShen = wxShengWo(minWx);
-  var yongShen = wxKe(maxWx);
-  if (xiShen === yongShen || !yongShen) yongShen = wxSheng(xiShen);
-  return { xiShen: xiShen, yongShen: yongShen, weak: minWx, strong: maxWx };
+
+  var strength = calcDayStrength(dayPillar, monthPillar, wxCount);
+  var dayWx = TG_WX[dayPillar.gan];
+  var yin = wxShengWo(dayWx), bi = dayWx;
+  var shi = wxSheng(dayWx), cai = wxKe(dayWx), sha = wxKeWo(dayWx);
+
+  var xiShen, yongShen, wxGood, wxAvoid;
+  if (strength.name === '身强') {
+    xiShen = cai;  yongShen = sha;
+    wxGood = [cai, sha, shi]; wxAvoid = [yin, bi];
+  } else if (strength.name === '中和偏强') {
+    xiShen = cai;  yongShen = shi;
+    wxGood = [cai, shi, sha]; wxAvoid = [yin];
+  } else if (strength.name === '中和偏弱') {
+    xiShen = yin;  yongShen = bi;
+    wxGood = [yin, bi]; wxAvoid = [sha, cai];
+  } else { // 身弱
+    xiShen = yin;  yongShen = bi;
+    wxGood = [yin, bi]; wxAvoid = [shi, cai, sha];
+  }
+  return { xiShen: xiShen, yongShen: yongShen, strengthName: strength.name,
+           strengthScore: strength.score, wxGood: wxGood, wxAvoid: wxAvoid };
 }
 
 /* ============================================================
@@ -1790,7 +1857,7 @@ function _doCalcBazi() {
     (DZ_CG[p.zhi] || []).forEach(function(g) { wxCount[TG_WX[g]] += 0.5; });
   });
 
-  var xiyong = getXiYongShen(wxCount);
+  var xiyong = getXiYongShen(wxCount, dayPillar, monthPillar);
 
   // 四柱（逐字浮现）
   var pillars = [
@@ -1892,13 +1959,24 @@ function _doCalcBazi() {
   var dayunHtml = '<p style="font-size:13px;color:var(--text-muted);margin-bottom:8px;">' +
     (dayunInfo.forward ? '顺排' : '逆排') + ' · 起运约 ' + dayunInfo.startAge + ' 岁 · 当前 ' + currentAge + ' 岁</p>' +
     '<div style="display:flex;flex-wrap:wrap;gap:6px;">';
+  // 每步大运标注是否喜/忌神运
+  var goodSet = {}, avoidSet = {};
+  (xiyong.wxGood || []).forEach(function(w) { goodSet[w] = true; });
+  (xiyong.wxAvoid || []).forEach(function(w) { avoidSet[w] = true; });
   dayunInfo.dayuns.forEach(function(dy) {
     var inRange = currentAge >= dy.startAge && currentAge <= dy.endAge;
+    var ganWx = TG_WX[dy.gan], zhiWx = DZ_WX[dy.zhi];
+    var goodCnt = (goodSet[ganWx] ? 1 : 0) + (goodSet[zhiWx] ? 1 : 0);
+    var badCnt = (avoidSet[ganWx] ? 1 : 0) + (avoidSet[zhiWx] ? 1 : 0);
+    var tag = '', color = 'var(--accent-red)';
+    if (goodCnt > badCnt) { tag = '<span style="color:#4a8a5a;font-size:10px;">喜用</span>'; color = '#4a8a5a'; }
+    else if (badCnt > goodCnt) { tag = '<span style="color:#b44a3a;font-size:10px;">忌神</span>'; color = '#b44a3a'; }
+    else if (goodCnt + badCnt > 0) { tag = '<span style="color:var(--text-muted);font-size:10px;">中和</span>'; }
     dayunHtml += '<div class="result-item" style="min-width:90px;flex:1;text-align:center;' +
       (inRange ? 'border:2px solid var(--accent-red);' : '') + '">' +
       '<div class="label">' + dy.startAge + '-' + dy.endAge + '岁</div>' +
-      '<div class="value" style="font-size:18px;color:var(--accent-red);font-family:KaiTi,serif;">' + dy.gan + dy.zhi + '</div>' +
-      '<div class="label" style="font-size:10px;">' + dy.startYear + '年起</div>' +
+      '<div class="value" style="font-size:18px;color:' + color + ';font-family:KaiTi,serif;">' + dy.gan + dy.zhi + '</div>' +
+      '<div class="label" style="font-size:10px;">' + dy.startYear + '年起 ' + tag + '</div>' +
       (inRange ? '<div class="label" style="color:var(--accent-red);font-size:10px;">◀ 当前</div>' : '') +
       '</div>';
   });
@@ -1925,16 +2003,20 @@ function _renderBaziDetail(dayPillar, monthPillar, yearPillar, hourPillar, wxCou
   var monthZhi = monthPillar.zhi;
   var dayZhi = dayPillar.zhi;
   var dayWxCount = wxCount[dayWx] || 0;
-  var shenQiang = dayWxCount >= 3 ? '身强' : (dayWxCount >= 2 ? '中和偏强' : '身弱');
+  // 使用基于月令的强弱判断（替代旧的仅看日主五行数量）
+  var shenQiang = xiyong.strengthName || (dayWxCount >= 3 ? '身强' : (dayWxCount >= 2 ? '中和偏强' : '身弱'));
+  // 简化标志位：是否身弱（含中和偏弱）
+  var isWeak = shenQiang === '身弱' || shenQiang === '中和偏弱';
+  var isStrong = shenQiang === '身强' || shenQiang === '中和偏强';
 
   // 格局
   var monthWx = DZ_WX[monthZhi];
   var geJu;
-  if (monthWx === wxSheng(dayWx)) geJu = '月令生扶日主，得月令之气，格局较高。';
+  if (monthWx === wxShengWo(dayWx)) geJu = '月令为印星生扶日主，得令而旺，格局较高。';
   else if (monthWx === dayWx) geJu = '日主与月令同气，根基稳固，自成格局。';
-  else if (monthWx === wxKe(dayWx)) geJu = '月令克制日主，需印星（' + wxShengWo(dayWx) + '）化解，格局带挑战。';
-  else if (dayWx === wxKe(monthWx)) geJu = '日主克月令，身强能任财官，格局主动进取。';
-  else if (dayWx === wxSheng(monthWx)) geJu = '日主生月令，食伤泄秀，才华外露之格。';
+  else if (monthWx === wxKeWo(dayWx)) geJu = '月令为官杀克制日主，需印星（' + wxShengWo(dayWx) + '）化解，身弱忌官杀。';
+  else if (monthWx === wxKe(dayWx)) geJu = '月令为财星，财旺身弱时反成负担，需印比助身。';
+  else if (monthWx === wxSheng(dayWx)) geJu = '月令为食伤泄秀，才华外露但易耗身。';
   else geJu = '格局中和，需结合大运流年看具体走势。';
 
   // 冲合
@@ -1952,10 +2034,10 @@ function _renderBaziDetail(dayPillar, monthPillar, yearPillar, hourPillar, wxCou
   if (!chongArr.length && !heArr.length) chongHe = '四柱地支无冲无合，命局平稳，人生起伏较小。';
 
   var overall = '';
-  overall += '<p style="text-indent:2em;margin-bottom:10px;"><strong>【日主分析】</strong>日主' + dayGan + '（' + dayWx + '），属' + dayYY + '性。本命造' + shenQiang + '，' +
-    (dayWxCount >= 3 ? '五行' + dayWx + '之力旺盛，个性鲜明，独立自主。但过旺则刚愎自用，宜柔和变通。' :
-     dayWxCount >= 2 ? '五行' + dayWx + '之力中和，性格平衡稳健，能刚能柔。' :
-     '五行' + dayWx + '之力偏弱，气质温和内敛。宜借助' + xiyong.xiShen + '的力量补益自身。') + '</p>';
+  overall += '<p style="text-indent:2em;margin-bottom:10px;"><strong>【日主分析】</strong>日主' + dayGan + '（' + dayWx + '），属' + dayYY + '性。本命造<strong style="color:var(--accent-red);">' + shenQiang + '</strong>（综合得分 ' + (xiyong.strengthScore !== undefined ? xiyong.strengthScore : '—') + '），' +
+    (isStrong ? '日主' + dayWx + '之力旺盛，个性鲜明独立。宜借食伤、财星、官杀来发挥所长，忌再添印比。' :
+     isWeak ? '日主' + dayWx + '失令乏力，气质内敛但易感力不从心。宜借助<strong style="color:#4a8a5a;">' + xiyong.xiShen + '（印）</strong>与<strong style="color:#4a8a5a;">' + xiyong.yongShen + '（比劫）</strong>来补益身气，远离土火等耗身之物。' :
+     '日主' + dayWx + '中和，能刚能柔。') + '</p>';
   overall += '<p style="text-indent:2em;margin-bottom:10px;"><strong>【格局简析】</strong>' + geJu + chongHe + '</p>';
 
   if (missing.length > 0) {
@@ -1978,25 +2060,28 @@ function _renderBaziDetail(dayPillar, monthPillar, yearPillar, hourPillar, wxCou
     if (ss === '正官') hasZhengGuan = true;
     if (ss === '七杀') hasQiSha = true;
   });
-  if (dayWxCount >= 3) {
-    careerHtml += '日主身强，能担官杀之重，事业上有魄力有担当。';
+  if (isStrong) {
+    careerHtml += '日主<strong>' + shenQiang + '</strong>，能担官杀之重，事业上有魄力有担当。';
     if (hasZhengGuan) careerHtml += '命带正官星，适合政府机构、大型企业、事业单位等体制内发展。';
     if (hasQiSha) careerHtml += '命带七杀星，适合军警、司法、管理、创业等领域。';
     if (!hasZhengGuan && !hasQiSha) careerHtml += '官杀不显，更适合自由职业、技术专长方向或自主创业。';
-  } else if (dayWxCount >= 2) {
-    careerHtml += '日主中和，事业适应性广，既能团队协作也能独立负责。';
+  } else if (isWeak) {
+    careerHtml += '日主<strong>' + shenQiang + '</strong>，事业上需借力发展。务必避开克身、耗身的行业，否则长期压力大、身心疲惫。宜在<strong style="color:#4a8a5a;">' + xiyong.xiShen + '、' + xiyong.yongShen + '</strong>五行的行业中发展，或寻找贵人提携。';
   } else {
-    careerHtml += '日主偏弱，事业上需借力发展，宜在' + xiyong.xiShen + '五行的行业中发展，或寻找属' + xiyong.xiShen + '的贵人提携。';
+    careerHtml += '日主中和，事业适应性广，既能团队协作也能独立负责。';
   }
-  var industryMap = {
-    '金':{strong:'金融证券、法律仲裁、精密机械、五金制造',weak:'土建地产、矿业能源、珠宝鉴定'},
-    '木':{strong:'教育出版、医疗健康、园林绿化、文化创意',weak:'水利航运、新闻传媒、艺术设计'},
-    '水':{strong:'贸易物流、旅游交通、信息技术、渔业水产',weak:'金融财务、保险证券、法律咨询'},
-    '火':{strong:'能源电力、餐饮娱乐、互联网科技、文化影视',weak:'教育培训、农林园艺、医疗保健'},
-    '土':{strong:'建筑工程、房地产开发、农业种植、仓储管理',weak:'文化传媒、电子商务、能源化工'}
+  // 五行→行业映射（用于按 xiyong 推荐 / 按 wxAvoid 警告）
+  var wxIndustry = {
+    '金':'金融、证券、银行、法律、财会、机械、精密制造、珠宝鉴定',
+    '木':'教育、出版、医疗、园林、文化创意、家具、纺织、林业',
+    '水':'贸易物流、互联网/IT、旅游、运输、传媒、水产、渔业、流动型服务',
+    '火':'能源电力、餐饮、影视娱乐、广告、化妆品、电子科技',
+    '土':'建筑、地产、土建、农业、仓储、陶瓷、矿产'
   };
-  var ind = industryMap[dayWx];
-  careerHtml += '<br>' + (dayWxCount >= 2.5 ? '适合：' + ind.strong : '宜借力发展：' + ind.weak) + '。';
+  var goodInds = (xiyong.wxGood || []).filter(function(w,i,a){return w && a.indexOf(w)===i;}).map(function(w){return w + '（' + wxIndustry[w] + '）';});
+  var avoidInds = (xiyong.wxAvoid || []).filter(function(w,i,a){return w && a.indexOf(w)===i;}).map(function(w){return w + '（' + wxIndustry[w] + '）';});
+  if (goodInds.length) careerHtml += '<br><strong style="color:#4a8a5a;">✅ 推荐行业：</strong>' + goodInds.join('；');
+  if (avoidInds.length) careerHtml += '<br><strong style="color:#b44a3a;">⚠ 不推荐：</strong>' + avoidInds.join('；') + '。';
   document.getElementById('bazi-career').innerHTML = '<p style="text-indent:2em;">' + careerHtml + '</p>';
 
   // 姻缘
@@ -2010,8 +2095,8 @@ function _renderBaziDetail(dayPillar, monthPillar, yearPillar, hourPillar, wxCou
   allZhis.forEach(function(z) { if (TAO_HUA[yearPillar.zhi] === z || TAO_HUA[dayZhi] === z) hasTaohua = true; });
   if (hasTaohua) loveHtml += '命带桃花星，异性缘旺，社交场合易吸引关注。';
 
-  if (dayWxCount >= 3) loveHtml += '日主身强，感情中较为主动强势，需注意给对方空间。';
-  else if (dayWxCount < 2) loveHtml += '日主偏弱，感情中较为被动，宜找能给自己安全感的伴侣。';
+  if (isStrong) loveHtml += '日主<strong>' + shenQiang + '</strong>，感情中较为主动强势，需注意给对方空间。';
+  else if (isWeak) loveHtml += '日主<strong>' + shenQiang + '</strong>，感情中较为被动，宜找能给自己安全感的伴侣，对方<strong style="color:#4a8a5a;">' + xiyong.xiShen + '/' + xiyong.yongShen + '</strong>五行旺者最相配。';
   document.getElementById('bazi-love').innerHTML = '<p style="text-indent:2em;">' + loveHtml + '</p>';
 
   // 财运
@@ -2021,15 +2106,21 @@ function _renderBaziDetail(dayPillar, monthPillar, yearPillar, hourPillar, wxCou
     if (ss === '正财') hasZhengCai = true;
     if (ss === '偏财') hasPianCai = true;
   });
-  if (dayWxCount >= 3) {
-    wealthHtml += '日主身强能任财，能赚能担之命。';
+  if (isStrong) {
+    wealthHtml += '日主<strong>' + shenQiang + '</strong>，身强能任财，是能赚能担之命。';
     if (hasZhengCai) wealthHtml += '命带正财星，正财运稳健，宜固定经营。';
     if (hasPianCai) wealthHtml += '命带偏财星，偏财运较好，投资理财有机遇。';
     if (!hasZhengCai && !hasPianCai) wealthHtml += '财星不显，财富来源更多依靠专业技能和辛勤劳动。';
-  } else if (dayWxCount >= 2) {
-    wealthHtml += '日主中和，财运平稳。理财风格宜稳健保守。';
+  } else if (isWeak) {
+    wealthHtml += '日主<strong>' + shenQiang + '</strong>，<strong style="color:#b44a3a;">身弱不担财</strong>。';
+    if (hasZhengCai || hasPianCai) {
+      wealthHtml += '命带' + (hasZhengCai ? '正财' : '') + (hasZhengCai && hasPianCai ? '、' : '') + (hasPianCai ? '偏财' : '') + '星<strong>透干</strong>，财源旺、机会多——但身弱担不住，往往<strong>赚得多花得多</strong>，开销失控，难以储蓄。理财必须靠强制性手段（定存、基金定投），不是天然稳健型。';
+    } else {
+      wealthHtml += '财星不显，又身弱难任，建议先培养自身能力（印比助身），少做高风险投资。';
+    }
+    wealthHtml += '大运逢<strong style="color:#4a8a5a;">' + xiyong.xiShen + '、' + xiyong.yongShen + '</strong>旺相之时财运最佳。';
   } else {
-    wealthHtml += '日主偏弱，身弱不担财，建议合作合伙获取财富。大运逢' + xiyong.xiShen + '旺之时财运最佳。';
+    wealthHtml += '日主中和，财运平稳。理财风格宜稳健保守。';
   }
   document.getElementById('bazi-wealth').innerHTML = '<p style="text-indent:2em;">' + wealthHtml + '</p>';
 
@@ -2678,6 +2769,55 @@ function getJianXing(lunarMonth, dayZhi) {
   return { name: jianxingNames[idx], isHuangdao: huangdao[idx] };
 }
 
+/* ---- 建除十二神 完整宜忌表（按通胜标准）---- */
+var JIANXING_YIJI = {
+  '建': { yi:['祭祀','祈福','出行','求嗣','会亲友','上官赴任'], ji:['动土','破土','安葬','嫁娶','开市','入宅'] },
+  '除': { yi:['祭祀','解除','扫舍','求医','断蚁','沐浴'], ji:['嫁娶','入宅','安葬','开市','栽种'] },
+  '满': { yi:['祭祀','祈福','纳财','开仓','纳畜','栽种'], ji:['嫁娶','安葬','服药','移徙','出行'] },
+  '平': { yi:['祭祀','修饰垣墙','平治道涂'], ji:['嫁娶','安葬','动土','栽种','开市'] },
+  '定': { yi:['祭祀','祈福','安床','入学','订盟','纳采'], ji:['词讼','出行','移徙','开渠'] },
+  '执': { yi:['祭祀','捕捉','畋猎','结网'], ji:['开仓','出货财','动土','出行','嫁娶'] },
+  '破': { yi:['祭祀','求医','破屋'], ji:['嫁娶','开市','动土','安葬','入宅','出行','签约'] },
+  '危': { yi:['祭祀','安床','捕捉'], ji:['登山','行船','出行','嫁娶','安葬'] },
+  '成': { yi:['祭祀','祈福','嫁娶','入宅','开市','动土','上梁','出行','栽种'], ji:['词讼','安葬'] },
+  '收': { yi:['祭祀','嫁娶','入学','纳财','捕捉'], ji:['出行','安葬','开仓','栽种'] },
+  '开': { yi:['祭祀','祈福','嫁娶','入宅','开市','上梁','入学','出行'], ji:['安葬','伐木','破土'] },
+  '闭': { yi:['祭祀','修筑堤防','塞穴'], ji:['嫁娶','开市','动土','开渠','栽种','安葬'] }
+};
+
+/* ---- 彭祖百忌 → 行为关键词映射 ---- */
+var PENGZU_TG = {
+  '甲':{key:'开仓',text:'甲不开仓财物耗散'},'乙':{key:'栽种',text:'乙不栽植千株不长'},
+  '丙':{key:'修灶',text:'丙不修灶必见灾殃'},'丁':{key:'剃头',text:'丁不剃头头必生疮'},
+  '戊':{key:'受田',text:'戊不受田田主不祥'},'己':{key:'破券',text:'己不破券二比并亡'},
+  '庚':{key:'经络',text:'庚不经络织机虚张'},'辛':{key:'合酱',text:'辛不合酱主人不尝'},
+  '壬':{key:'汲水',text:'壬不汲水更难提防'},'癸':{key:'词讼',text:'癸不词讼理弱敌强'}
+};
+var PENGZU_DZ = {
+  '子':{key:'问卜',text:'子不问卜自惹祸殃'},'丑':{key:'冠带',text:'丑不冠带主不还乡'},
+  '寅':{key:'祭祀',text:'寅不祭祀神鬼不尝'},'卯':{key:'穿井',text:'卯不穿井水泉不香'},
+  '辰':{key:'哭泣',text:'辰不哭泣必主重丧'},'巳':{key:'出行',text:'巳不远行财物伏藏'},
+  '午':{key:'苫盖',text:'午不苫盖屋主更张'},'未':{key:'服药',text:'未不服药毒气入肠'},
+  '申':{key:'安床',text:'申不安床鬼祟入房'},'酉':{key:'会客',text:'酉不会客醉坐颠狂'},
+  '戌':{key:'吃犬',text:'戌不吃犬作怪上床'},'亥':{key:'嫁娶',text:'亥不嫁娶不利新郎'}
+};
+
+/* ---- 煞方推算（三合局）---- */
+function getShaFang(dayZhi) {
+  if ('申子辰'.indexOf(dayZhi) >= 0) return '南';
+  if ('巳酉丑'.indexOf(dayZhi) >= 0) return '东';
+  if ('寅午戌'.indexOf(dayZhi) >= 0) return '北';
+  return '西'; // 亥卯未
+}
+
+/* ---- 计算冲日的完整干支 ----
+   规则：天干 +4 (mod 10)，地支 +6 (mod 12) */
+function getConflictPillar(dayGan, dayZhi) {
+  var ganIdx = (TIAN_GAN.indexOf(dayGan) + 4) % 10;
+  var zhiIdx = (DI_ZHI.indexOf(dayZhi) + 6) % 12;
+  return { gan: TIAN_GAN[ganIdx], zhi: DI_ZHI[zhiIdx] };
+}
+
 function loadHuangli(dateOverride) {
   var date = dateOverride || new Date();
   var year = date.getFullYear(), month = date.getMonth() + 1, day = date.getDate();
@@ -2694,21 +2834,27 @@ function loadHuangli(dateOverride) {
     (nextJq.date.getMonth() + 1) + ' 月 ' + nextJq.date.getDate() + ' 日）还有 <strong>' +
     daysToJq + '</strong> 天';
 
-  // 干支冲煞
-  var conflictZhi = LIU_CHONG[dayZhi] || dayZhi;
-  var conflictSx = SHENG_XIAO[DI_ZHI.indexOf(conflictZhi)];
+  // 冲煞（完整：冲X(干支)煞方）
+  var conflictPillar = getConflictPillar(dayGan, dayZhi);
+  var conflictSx = SHENG_XIAO[DI_ZHI.indexOf(conflictPillar.zhi)];
+  var shaFang = getShaFang(dayZhi);
+
+  // 十二建星 + 宜忌
   var jianxing = getJianXing(lunar.lunarMonth, dayZhi);
+  var jxYiji = JIANXING_YIJI[jianxing.name] || { yi:['祭祀'], ji:['嫁娶','安葬'] };
+  var yiList = jxYiji.yi.slice();
+  var jiList = jxYiji.ji.slice();
 
-  var bigYi = ['嫁娶','开业','签约','搬家','动土','装修','订婚','开市','入宅'];
-  var smallYi = ['祭祀','出行','求医','理发','沐浴','栽种','会友','扫舍'];
-  var hardJi = ['安葬','行丧','破土','修坟','立碑'];
-  var bigJi = ['嫁娶','开业','动土','签约','装修','安床','伐木','作灶','上梁'];
+  // 应用彭祖百忌：天干/地支 forbidden 关键词 → 从宜里移除并加到忌里
+  var pgTg = PENGZU_TG[dayGan], pgDz = PENGZU_DZ[dayZhi];
+  [pgTg, pgDz].forEach(function(p) {
+    if (!p) return;
+    yiList = yiList.filter(function(y) { return y !== p.key && y.indexOf(p.key) < 0; });
+    if (jiList.indexOf(p.key) < 0) jiList.push(p.key);
+  });
 
-  var yiList, jiList;
-  if (jianxing.isHuangdao) { yiList = bigYi.concat(smallYi); jiList = hardJi.slice(); }
-  else { yiList = smallYi.slice(); jiList = hardJi.concat(bigJi); }
-  if (jianxing.name === '破') { yiList = ['祭祀','沐浴','扫舍']; jiList = ['嫁娶','开业','动土','签约','搬家','装修','入宅']; }
-  if (jianxing.name === '闭') yiList = yiList.filter(function(y) { return ['祭祀','沐浴','扫舍'].indexOf(y) >= 0; });
+  // 余事勿取（如宜列表很少，加这个传统短语）
+  if (yiList.length <= 3 && yiList.indexOf('余事勿取') < 0) yiList.push('余事勿取');
 
   // 首屏大字摘要
   document.getElementById('hl-summary').innerHTML =
@@ -2717,22 +2863,43 @@ function loadHuangli(dateOverride) {
     '<div class="hl-summary-ji"><div class="hl-summary-title">❌ 今日忌</div><div class="hl-summary-big">' +
     jiList.slice(0, 2).join(' ') + '</div></div>';
 
-  // 方位
-  var caishen = ({'甲':'东北','乙':'正北','丙':'西南','丁':'西南','戊':'正北','己':'正北','庚':'正东','辛':'正东','壬':'正南','癸':'正南'})[dayGan];
-  var xishen = ({'甲':'西北','乙':'西北','丙':'西南','丁':'西南','戊':'东南','己':'东南','庚':'正西','辛':'正西','壬':'正南','癸':'正南'})[dayGan];
-  var fushen = ({'甲':'正北','乙':'正北','丙':'正东','丁':'正东','戊':'正南','己':'正南','庚':'西南','辛':'西南','壬':'西北','癸':'西北'})[dayGan];
+  // 方位（修正版：财神/喜神/福神，按通胜标准）
+  var caishen = ({'甲':'东北','乙':'东北','丙':'西南','丁':'西南','戊':'正北','己':'正北','庚':'正东','辛':'正东','壬':'正南','癸':'正南'})[dayGan];
+  var xishen = ({'甲':'东北','乙':'西北','丙':'西南','丁':'正南','戊':'东南','己':'东北','庚':'西北','辛':'西南','壬':'正南','癸':'东南'})[dayGan];
+  var fushen = ({'甲':'东南','乙':'东南','丙':'正东','丁':'正东','戊':'正北','己':'正南','庚':'西南','辛':'西南','壬':'西北','癸':'西北'})[dayGan];
+
+  // 纳音五行
+  var nayinMap = {
+    '甲子':'海中金','乙丑':'海中金','丙寅':'炉中火','丁卯':'炉中火','戊辰':'大林木','己巳':'大林木',
+    '庚午':'路旁土','辛未':'路旁土','壬申':'剑锋金','癸酉':'剑锋金','甲戌':'山头火','乙亥':'山头火',
+    '丙子':'涧下水','丁丑':'涧下水','戊寅':'城头土','己卯':'城头土','庚辰':'白蜡金','辛巳':'白蜡金',
+    '壬午':'杨柳木','癸未':'杨柳木','甲申':'泉中水','乙酉':'泉中水','丙戌':'屋上土','丁亥':'屋上土',
+    '戊子':'霹雳火','己丑':'霹雳火','庚寅':'松柏木','辛卯':'松柏木','壬辰':'长流水','癸巳':'长流水',
+    '甲午':'沙中金','乙未':'沙中金','丙申':'山下火','丁酉':'山下火','戊戌':'平地木','己亥':'平地木',
+    '庚子':'壁上土','辛丑':'壁上土','壬寅':'金箔金','癸卯':'金箔金','甲辰':'覆灯火','乙巳':'覆灯火',
+    '丙午':'天河水','丁未':'天河水','戊申':'大驿土','己酉':'大驿土','庚戌':'钗钏金','辛亥':'钗钏金',
+    '壬子':'桑柘木','癸丑':'桑柘木','甲寅':'大溪水','乙卯':'大溪水','丙辰':'沙中土','丁巳':'沙中土',
+    '戊午':'天上火','己未':'天上火','庚申':'石榴木','辛酉':'石榴木','壬戌':'大海水','癸亥':'大海水'
+  };
+  var nayin = nayinMap[dayGan + dayZhi] || (dayWx + '日');
 
   var jxTag = jianxing.isHuangdao
     ? '<span class="tag tag-green">' + jianxing.name + '日·黄道吉日</span>'
     : '<span class="tag tag-red">' + jianxing.name + '日·黑道凶日</span>';
 
+  // 彭祖百忌展示文本
+  var pengzuTxt = (pgTg ? pgTg.text : '') + (pgTg && pgDz ? '<br>' : '') + (pgDz ? pgDz.text : '');
+
   document.getElementById('huangli-content').innerHTML =
     '<div class="huangli-item"><div class="hl-label">📅 公历（阳历）</div><div class="hl-value">' + year + ' 年 ' + month + ' 月 ' + day + ' 日</div></div>' +
     '<div class="huangli-item"><div class="hl-label">🌙 农历（阴历）</div><div class="hl-value">' + lunarStr + '</div></div>' +
-    '<div class="huangli-item"><div class="hl-label">🔥 干支</div><div class="hl-value">' + dayGan + dayZhi + ' · ' + dayWx + '</div></div>' +
-    '<div class="huangli-item"><div class="hl-label">⭐ 建星</div><div class="hl-value">' + jxTag + '</div></div>' +
-    '<div class="huangli-item"><div class="hl-label">🐲 冲煞</div><div class="hl-value" style="color:#b44a3a;">冲' + conflictSx + '（' + conflictZhi + '）</div></div>' +
-    '<div class="huangli-item"><div class="hl-label">📜 五行</div><div class="hl-value">' + dayWx + '日</div></div>';
+    '<div class="huangli-item"><div class="hl-label">🔥 干支纳音</div><div class="hl-value">' + dayGan + dayZhi + ' · ' + dayWx +
+    '<br><small style="color:var(--text-muted);">' + nayin + '</small></div></div>' +
+    '<div class="huangli-item"><div class="hl-label">⭐ 建星值日</div><div class="hl-value">' + jxTag + '</div></div>' +
+    '<div class="huangli-item"><div class="hl-label">🐲 冲煞</div><div class="hl-value" style="color:#b44a3a;">冲' + conflictSx +
+    '（' + conflictPillar.gan + conflictPillar.zhi + '）<br><small>煞' + shaFang + '</small></div></div>' +
+    '<div class="huangli-item"><div class="hl-label">📜 彭祖百忌</div><div class="hl-value" style="font-size:12px;line-height:1.6;">' +
+    (pengzuTxt || '今日无忌') + '</div></div>';
 
   document.getElementById('huangli-detail').innerHTML =
     '<div class="result-grid">' +
@@ -2741,7 +2908,7 @@ function loadHuangli(dateOverride) {
     '<div class="result-item"><div class="label">💰 财神方</div><div class="value">' + caishen + '</div></div>' +
     '<div class="result-item"><div class="label">😊 喜神方</div><div class="value">' + xishen + '</div></div>' +
     '<div class="result-item"><div class="label">🙏 福神方</div><div class="value">' + fushen + '</div></div>' +
-    '<div class="result-item"><div class="label">📅 节气</div><div class="value">' + nextJq.name + '（' + daysToJq + '天后）</div></div>' +
+    '<div class="result-item"><div class="label">📅 下一节气</div><div class="value">' + nextJq.name + '（' + daysToJq + ' 天后）</div></div>' +
     '</div>';
 }
 
@@ -3036,6 +3203,7 @@ document.addEventListener('DOMContentLoaded', function() {
   // 初始Tab
   switchTab('bazi');
 });
+
 
 </script>
 
